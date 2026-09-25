@@ -172,7 +172,7 @@ USAGE_FILE = ".usage"
 # What it does not survive: an unclean shutdown under CHAT_FSYNC=0 can lose the last write,
 # leaving the count stale until the next reap (<= REAP_EVERY). Accepted deliberately — the
 # alternative is fsyncing a counter on every create, which is the cost being removed.
-NOTES_FILE = ".notes-count"
+COUNTERS_FILE, SNAPSHOTS_FILE, NOTES_FILE = ".counters", ".snapshots", ".notes-count"
 # >= MAX_ROOMS, and exactly MAX_ROOMS unless an operator says otherwise: the reserved
 # namespaces (topic, room-owners, room-allow, room-nonce) hold at most one note per room, so
 # that floor is the invariant that lets EVERY room carry a topic and an owner. Raising
@@ -242,7 +242,6 @@ EVENTS_ROOM, EVENTS_NICK = "events", "server"
 # per-room and dies with the room, compaction drops lines, and the reaper deletes whole
 # files. Summing `last_seq` across rooms therefore *decreases* on a reap, which would make
 # a "messages since the last digest" delta negative. These four only ever go up.
-COUNTERS_FILE = ".counters"
 COUNTER_KEYS = (
     "messages",
     "rooms_created",
@@ -251,69 +250,14 @@ COUNTER_KEYS = (
     "notes_written",
     "topics_written",
 )
-# Periodic aggregate samples, so growth over a window is answerable at all: the counters
-# above say what the totals are *now*, and nothing but a stored history says what they were
-# a day ago. Kept here rather than in the reader because the service is the only thing that
-# is always running — a reader that holds its own history reports "no data" for a full day
-# every time it is restarted or redeployed, and that was the failure worth designing out.
-SNAPSHOTS_FILE = ".snapshots"
-# Taken on the write path under the same throttle as the reaper (see `_snapshot`), so the
-# cadence costs one extra pass per interval on a service that is already walking these
-# directories to reap. Nothing runs in the background.
-SNAPSHOT_EVERY = 300
-# 24h is the longest window a digest reports; the surplus is what keeps a lookback sample
-# available after an interval is missed, instead of losing the window entirely.
+SNAPSHOT_EVERY, REAP_EVERY = 300, 600
 SNAPSHOT_KEEP_SECONDS, IDLE_SECONDS = 30 * 3600, 7 * 86400  # untouched rooms/notes reaped
-# A full store walk is worth amortizing: cleanup and count repair may lag ten minutes.
-# Retention ages stay separate; making a pass less frequent does not retire data sooner.
-REAP_EVERY = 600
-# A room that never got past its first message is a monologue, not a conversation: someone
-# said one thing, nobody answered, and it is holding a slot against MAX_ROOMS. A week is
-# what a conversation that stopped is worth; a day is what an unanswered opener is worth.
-# This is the disposal half of the §II.2.2 zero-response tripwire — the aggregates measure
-# unanswered rooms, this stops them accumulating. Rooms only: a note has no reply to wait
-# for, so "one write" says nothing about it.
-#
-# A knob (CHAT_STILLBORN_SECONDS) rather than the constant this was, because on a deployment
-# where most rooms are one-message it — not MAX_ROOMS — is what sets the room turnover rate.
-# The default is the 86400 it was hardcoded to, so an instance that sets nothing does not move.
-#
-# Clamped HERE rather than in config.py because both bounds are this module's: the value has to
-# be the one the reaper enforces, and the reaper is below.
-#   - Capped at IDLE_SECONDS, because `_reapable` tests the idle rule FIRST. Anything larger is
-#     unreachable — set ten days and the documents promise ten while the room goes on day seven.
-#   - Floored to a whole hour, because the manual renders it in them (`__STILLBORN_HOURS__`) and
-#     both capacity refusals compute the same `// 3600`. At 5400 the reaper would wait 90
-#     minutes while every document promised one hour.
-# config.py holds the other half of the floor (>= 3600), and /config publishes THIS value, not
-# config's, so what an operator reads back is what the reaper does.
-STILLBORN_SECONDS = min(IDLE_SECONDS, config.STILLBORN_SECONDS) // 3600 * 3600
-STILLBORN_MESSAGES = 1
-
-# Room name classes. A name is a chain of leading `<class>-` markers followed by a body,
-# so classes compose: `mb-p-<random>` is a mailbox that is also unlisted, `e-p-<random>` a
-# private room that also decays. Prefix matching costs the obvious collision — a room
-# genuinely about e-commerce is `e-commerce`, i.e. ephemeral — but that is the price the
-# existing `p-` rule already paid, and one namespace with one rule beats four bespoke ones.
-#   p   unlisted (capability URL; the name is the only secret)
-#   mb  mailbox: writes require the signed lane
-#   d   ownable: a /kv/room-owners/<room> claim can gate writes to listed keys
-#   e   ephemeral: messages older than EPHEMERAL_TTL_SECONDS are dropped on read
-ROOM_CLASSES = ("p", "mb", "d", "e")
-# Ownership of an *established* open room would let a stranger lock everyone else out, so
-# only the `d-` class is ownable at all — a room is owned from birth or never. These two
-# are denied on top of that, hardcoded, because they are the rendezvous points every agent
-# is told about: a claim on either would be a claim on the front door.
-UNOWNABLE_ROOMS = ("lobby", "meta")
-OWNERS_NS = "room-owners"  # /kv/room-owners/<room> -> the owner's did:key
-ALLOW_NS = "room-allow"  # /kv/room-allow/<room>  -> space-separated did:keys
-# Server-written, world-readable: the highest nonce accepted for a room's signed kv writes.
-# Notes are durable and have no ring, so unlike a message a captured signed note URL would
-# replay forever — and replaying an *old* allow-list is how a revoked key gets itself back
-# in. This is the smallest state that closes that, and it rides the existing CAS primitive
-# for its own atomicity. MAX_NOTES_PER_NS >= MAX_ROOMS, so every room may hold an owner.
-NONCE_NS = "room-nonce"
-TOPIC_NS = "topic"  # /kv/topic/<room>      -> what the room is for
+STILLBORN_SECONDS, STILLBORN_MESSAGES = (
+    min(IDLE_SECONDS, config.STILLBORN_SECONDS) // 3600 * 3600,
+    1,
+)
+ROOM_CLASSES, UNOWNABLE_ROOMS = ("p", "mb", "d", "e"), ("lobby", "meta")
+OWNERS_NS, ALLOW_NS, NONCE_NS, TOPIC_NS = "room-owners", "room-allow", "room-nonce", "topic"
 # A topic is an ordinary note (MAX_VALUE_CHARS), and /rooms shows one per room it lists:
 # printed in full that is a reply measured in hundreds of KB, against a response budget
 # measured in kilobytes. The overview
@@ -1836,25 +1780,19 @@ def _drop_emptied_namespaces(
             for ns in namespaces:
                 before, after = before_ns.get(ns.path), _read_counts(Path(ns.path))
                 file = f"{ns.path}{os.sep}{NOTES_FILE}"
-                # Steady at both ends and equal to the walk between them, or never there at
-                # all: nothing to heal. A file that will not parse reads as neither, and the
-                # `or` chain is why the access check costs a syscall only when it decides.
                 fresh = before and after and before[0] == per_ns[ns.path] == after[0]
-                settled = fresh or not (before or after or os.access(file, os.F_OK))
-                if settled and ns.path not in dirs:
+                if (
+                    fresh or not (before or after or os.access(file, os.F_OK))
+                ) and ns.path not in dirs:
                     continue
                 try:
                     with _locked((root / NOTES_FILE).with_suffix(".create")):
                         Path(file).unlink(missing_ok=True)
                         if ns.path in dirs:
-                            # Buckets first: since sharding a namespace's notes sit a level
-                            # further down, so a drained namespace holds empty directories,
-                            # and rmdir refuses those exactly as it refuses notes. Without
-                            # this the namespace below never goes.
                             _prune(ns.path)
-                            os.rmdir(ns.path)  # rmdir refuses a directory with entries
+                            os.rmdir(ns.path)
                 except OSError:
-                    continue  # a tree we may not write, or a create that got there first
+                    continue
     except OSError:
         pass  # no notes yet, or nothing readable: no count to heal and no namespace to drop
 
